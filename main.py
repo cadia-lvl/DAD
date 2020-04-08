@@ -1,123 +1,74 @@
 import os
-from concurrent.futures import ProcessPoolExecutor
-from functools import partial
+import shutil
+import errno
+import json
 
 import librosa
-import matplotlib.pyplot as plt
 import numpy as np
+import soundfile as sf
+
 from tqdm import tqdm
 
 
-def check_directory(directory, out_path: str, checks: list, max_workers: int = 16):
+def join_collections(a_dir: str, b_dir: str, out_dir: str):
     '''
-    Runs check_sample on all samples in a directory
+    Joins two dataset exports into a single export. The export
+    at a_dir will be used as the base for the joined exporrt which
+    will be located at out_dir
+
     Input arguments:
-    * directory (str): A path to a directory containing one or more waveform files
-    * out_path (str): A target path for an output file containing results
-    * checks (list): A list of callable checks that return False if
-    the sample passes the check
-    * max_workers (int=16): The number of parallel workers
+    * a_dir (str): The path to the first dataset export
+    * b_dir (str): The path to the second dataset export
+    * out_dir (str): The target path for the joined export
     '''
-    executor = ProcessPoolExecutor(max_workers=max_workers)
 
-    read_futures = []
-    check_futures = []
+    # Copy all at a_dir over to out_dir
+    print(f"Copying data from {a_dir} to {out_dir}, this could take some time.")
+    copy_tree(a_dir, out_dir)
+    print(f"Done, adding data from {b_dir} to {out_dir}.")
 
-    for fname in os.listdir(directory):
-        path = os.path.join(directory, fname)
-
-        read_futures.append([
-            fname, executor.submit(partial(load_sample, path))])
-
-    samples = [(future[0], future[1].result()) for future in tqdm(read_futures)]
-
-    for sample in samples:
-        check_futures.append([sample[0], executor.submit(partial(
-            check_sample, sample[1], checks))])
-
-    answers = [(future[0], future[1].result()) for future in tqdm(check_futures)]
-
-    with open(out_path, 'w') as o_f:
-        for answer in answers:
-            if answer[1]:
-                o_f.write(f'{answer[0]}\t{answer[1][1]}\n')
+    out_meta = json.load(open(os.path.join(a_dir, 'meta.json')))
+    out_info = json.load(open(os.path.join(a_dir, 'info.json')))
+    b_meta = json.load(open(os.path.join(b_dir, 'meta.json')))
+    b_info = json.load(open(os.path.join(b_dir, 'info.json')))
 
 
-def check_sample(y:np.ndarray, checks: list):
-    '''
-    Returns True if sample passes all checks.
-    Input arguments:
-    * y (np.ndarray): A [n] shaped numpy array containing the signal
-    * checks (list): A list of callable checks that return False if
-    the sample passes the check
-    '''
-    for check in checks:
-        if check(y):
-            return True, check.__name__
-    return False
+    print(f'Adding audio from {b_dir}')
+    for speaker in b_meta['speakers']:
+        print(f'Copying audio from {speaker["name"]} in the second collection')
+        # make sure that the speaker directory exists in the combined collection
+        speaker_out_dir = os.path.join(out_dir, 'audio', str(speaker['id']))
+        if not os.path.exists(speaker_out_dir):
+            os.makedirs(speaker_out_dir)
+        speaker_b_dir = os.path.join(b_dir, 'audio', str(speaker['id']))
+        for fname in tqdm(os.listdir(os.path.join(speaker_b_dir))):
+            shutil.copyfile(os.path.join(speaker_b_dir, fname),
+                os.path.join(speaker_out_dir, fname))
 
+    print(f'Adding text from {b_dir}')
+    for fname in tqdm(os.listdir(os.path.join(b_dir, 'text'))):
+        shutil.copyfile(os.path.join(b_dir, 'text', fname),
+            os.path.join(out_dir, 'text', fname))
 
-def load_sample(path:str):
-    #wf = wave.open(path, 'rb')
-    #sr, nchannels = wf.getparams().framerate, wf.getparams().nchannels
-    y, _ = librosa.core.load(path, sr=None, mono=True)
-    return y
+    print(f'Adding other information from {b_dir}')
+    out_info = {**out_info, **b_info}
+    for speaker in b_meta['speakers']:
+        if speaker['id'] not in [s['id'] for s in out_meta['speakers']]:
+            out_meta['speakers'] += speaker
+    out_meta['sub_collection'] = b_meta['collection']
 
+    with open(os.path.join(out_dir, 'info.json'), 'w', encoding='utf-8') as info_f:
+        json.dump(out_info, info_f, ensure_ascii=False, indent=4)
+    with open(os.path.join(out_dir, 'meta.json'), 'w', encoding='utf-8') as meta_f:
+        json.dump(out_meta, meta_f, ensure_ascii=False, indent=4)
+    with open(os.path.join(out_dir, 'index.tsv'), 'a') as out_index_f, open(os.path.join(b_dir, 'index.tsv')) as b_index_f:
+        for line in b_index_f:
+            out_index_f.write(line)
 
-def signal_is_too_high(y:np.ndarray, thresh: float = -4.5, num_frames :int = 1):
-    '''
-    If the signal exceeds the treshold for a certain number of frames or
-    more consectuively, it is deemed too high
-    Input arguments:
-    * y (np.ndarray): A [n] shaped numpy array containing the signal
-    * thresh (float=-4.5): A db threshold
-    * num_frames (int=20): A number of frames
-    '''
-    db = librosa.amplitude_to_db(y)
-    thresh_count = 0
-    for i in range(len(db)):
-        if db[i] > thresh:
-            thresh_count += 1
-            if thresh_count == num_frames:
-                return True
-        else:
-            thresh_count = 0
-    return False
-
-
-def signal_is_too_low(y:np.ndarray, thresh: float = -15):
-    '''
-    If the signal never exceeds the treshold it is deemed too low
-    Input arguments:
-    * y (np.ndarray): A [n] shaped numpy array containing the signal
-    * thresh (float=-18): A db threshold
-    '''
-    db = librosa.amplitude_to_db(y)
-    return not any(db_val > thresh for db_val in db)
-
-
-def avg_db(y:np.ndarray, top_db: int=45):
-    # TODO: Not finished and not currently used
-    '''
-    Return the average power level in dB. The signal is split into
-    segments that we believe are non-silent to avoid accounting for
-    silence periods in calculations
-
-    * y (np.ndarray): A [n] shaped numpy array containing the signal
-    * top_db (int): Threshold in decibels. Anything above threshold is
-    assumed to be non-silence
-    '''
-    intervals = librosa.effects.split(y, top_db=top_db)
-    total = 0.0
-    num_frames = 0
-    for splits in intervals:
-        period = y[splits[0]:splits[1]]
-        total += np.sum(librosa.core.amplitude_to_db(period))
-        num_frames += splits[1] - splits[0]
-    t1 = total/num_frames
-    t2 = np.average(librosa.core.amplitude_to_db(y))
-    t3 = np.average(librosa.core.amplitude_to_db(librosa.effects.trim(y, top_db=45)[0]))
-    return t1, t2, t3
-
-if __name__ == '__main__':
-    check_directory('/home/atli/Data/lobe_data/margret_bad_small/', 'check_test.txt', checks=[signal_is_too_high, signal_is_too_low])
+def copy_tree(src, dst):
+    try:
+        shutil.copytree(src, dst)
+    except OSError as exc:
+        if exc.errno  == errno.ENOTDIR:
+            shutil.copy(src, dst)
+        else: raise
