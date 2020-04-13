@@ -1,7 +1,7 @@
 import os
 from concurrent.futures import ProcessPoolExecutor
 from functools import partial
-from io import load_sample
+from in_out import load_sample
 
 import librosa
 import numpy as np
@@ -34,8 +34,8 @@ def check_directory(directory, good_path: str, bad_path:str, checks: list,
                 gf.write(f"{p}\n")
 
 
-def check(p, checks):
-    y, sr = load_sample(p)
+def check(path: str, checks: list):
+    y, sr = load_sample(path)
     return check_sample(y, checks)
 
 

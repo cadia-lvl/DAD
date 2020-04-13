@@ -1,5 +1,6 @@
 import librosa
 import soundfile as sf
+import numpy as np
 
 def load_sample(path:str):
     #wf = wave.open(path, 'rb')
