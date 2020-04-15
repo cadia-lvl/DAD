@@ -8,7 +8,7 @@ import numpy as np
 import soundfile as sf
 
 from tqdm import tqdm
-
+from in_out import dump_json
 
 def join_collections(a_dir: str, b_dir: str, out_dir: str):
     '''
@@ -57,10 +57,8 @@ def join_collections(a_dir: str, b_dir: str, out_dir: str):
             out_meta['speakers'] += speaker
     out_meta['sub_collection'] = b_meta['collection']
 
-    with open(os.path.join(out_dir, 'info.json'), 'w', encoding='utf-8') as info_f:
-        json.dump(out_info, info_f, ensure_ascii=False, indent=4)
-    with open(os.path.join(out_dir, 'meta.json'), 'w', encoding='utf-8') as meta_f:
-        json.dump(out_meta, meta_f, ensure_ascii=False, indent=4)
+    dump_json(out_info, os.path.join(out_dir, 'info.json'))
+    dump_json(out_meta, os.path.join(out_dir, 'meta.json'))
     with open(os.path.join(out_dir, 'index.tsv'), 'a') as out_index_f, open(os.path.join(b_dir, 'index.tsv')) as b_index_f:
         for line in b_index_f:
             out_index_f.write(line)

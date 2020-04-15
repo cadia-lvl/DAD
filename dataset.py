@@ -5,9 +5,12 @@ import operator
 import shutil
 from random import shuffle
 from collections import defaultdict
-from check import check, signal_is_too_high
-
+from check import check, signal_is_too_high, signal_is_too_low
+from in_out import load_sample, save_sample, dump_json, bool_input, duration
 from tqdm import tqdm
+from trim import trim_sample
+import librosa
+
 
 
 
@@ -34,6 +37,7 @@ class Dataset:
         print("Building from info.json ...")
         self.info = json.load(open(os.path.join(path, 'info.json')))
         for rec_id, info in tqdm(self.info.items()):
+            rec_id = int(rec_id)
             if info['text_info']['id'] not in self._sentences:
                 self.add_sentence(parse_sentence(info['text_info'],
                     info['other']['text_marked_bad'], path))
@@ -95,13 +99,42 @@ class Dataset:
         assert format in formats, "format not valid"
         return round(sum(r.duration for r in self.recording_objs)/formats[format],2)
 
+    def trim_recordings(self, top_db: float = 45):
+        print("Iterating recordings ...")
+        for recording in tqdm(self.recording_objs):
+            self.trim_recording(recording.id, save_info=False)
+        self.save_info()
+
+    def trim_recording(self, id:int, top_db: float = 45,
+        save_info: bool = True):
+        self.get_recording(id).trim(top_db)
+        self.update_recording_info(id)
+        if save_info:
+            self.save_info()
+
+    def delete_bad_recordings(self, checks: list = [signal_is_too_high, signal_is_too_low]):
+        print("Iterating recordings ... ")
+        bad_ids = set()
+        for recording in tqdm(self.recording_objs):
+            is_bad = self.check_recording(recording.id, checks)
+            if is_bad:
+                bad_ids.add(recording.id)
+        for rec_id in bad_ids:
+            self.delete_recording(rec_id, save=False)
+
+        self.save_index()
+        self.save_info()
+        print(f"Deleted {len(bad_ids)} bad recordings.")
+
     def check_recording(self, id:int, checks: list):
-        return check(self.get_recording(id).path, checks)
+        # TODO: replace with a Recording method
+        return self.get_recording(id).check(checks)
 
     def verify_recording(self, id:int, checks: list):
         '''
         Returns True if the recording passes all the checks
         '''
+        # TODO: Replace with a Recording method
         is_bad, _ = self.check_sample(id, checks)
         return not is_bad
 
@@ -127,51 +160,107 @@ class Dataset:
             ncs[str(rec.sox_num_channels)] += 1
         report(srs, bds, ncs)
 
-    def convert(self, sr: int = 16000, bit_depth: int = 16,
-        n_channels: int = 1, name: str = ''):
+    def delete_recording(self, id: int, save: bool = True):
         '''
-        Convert a dataset to the given format. Note that this
-        will create a new audio directory at ./audio_{sr}_{bit_depth}_{n_channels}
-        and a new ./info_{sr}_{bit_depth}_{n_channels}.json unless the <name> input
-        argument is specified in which case both paths will be like ./*_{name}*
+        Delete a recording from a dataset.
+        Input arguments:
+        * id (int): The id of the recording
+        * save (bool=False): If True, save info.json and index.tsv
+        '''
+        # remove from OS
+        self.get_recording(id).os_delete()
+        sentence = self.get_sentence(self.get_recording(id).sentence_id)
+        sentence.remove_recording_id(id)
+        del self._recordings[id]
+        del self.info[str(id)]
+        if save:
+            self.save_index()
+            self.save_info()
+
+    def convert(self, sr: int = 16000, bit_depth: int = 16,
+        n_channels: int = 1, name: str = '', overwrite: bool = False):
+        '''
+        Convert a dataset to the given format. NOTE: This will write
+        over existing files!
 
         Input arguments:
         * sr (int=16000): The desired sample rate
         * bit_depth (int=16): The desired bit depth
         * n_channels (int=1): The desired number of channels
         * name (str=''): The name of the converted dataset
+        * overwrite (bool=False): If True, replace /audio and info.json
+        with the converted versions
         '''
         tfm = sox.Transformer()
-        tfm.convert(sr=sr, bit_depth=bit_depth, n_channels=n_channels)
+        tfm.convert(samplerate=sr, bitdepth=bit_depth, n_channels=n_channels)
+
+        # create converted audio file structure
+        for speaker in self.speakers:
+            os.makedirs(os.path.join(self.path,
+                f'audio_{sr}_{bit_depth}_{n_channels}', str(speaker.id)))
 
         print('converting files...')
         for recording in tqdm(self.recording_objs):
-            recording.convert(tfm,)
+            recording.convert(sr, bit_depth, n_channels,
+            transformer=tfm)
+            self.update_recording_info(recording.id)
+        self.save_info(fname=f'info_{sr}_{bit_depth}_{n_channels}.json')
+        if overwrite:
+            # delete /audio/* and info.json and replace with new data
+            shutil.rmtree(os.path.join(self.path, 'audio'))
+            os.rename(os.path.join(self.path, f'audio_{sr}_{bit_depth}_{n_channels}'),
+                os.path.join(self.path, 'audio'))
+            os.remove(os.path.join(self.path, 'info.json'))
+            os.rename(os.path.join(self.path, f'info_{sr}_{bit_depth}_{n_channels}.json'),
+                os.path.join(self.path, 'info.json'))
 
-    def create_index(self, sort_by: str = 'score'):
+    def update_recording_info(self, id:int, info: dict = {}):
+        '''
+        Updates the current information for a recording with a given
+        id to self.info. Note this does not change info.json on disk.
+        Call self.save_info() for that.
+        '''
+        if not info:
+            info = self.get_recording(id).info
+        self.info[str(id)]['recording_info'] = info
+
+    def save_index(self, sort_by: str = ''):
         '''
         Create a new index.tsv file for this collection given a
         sort critera
 
         Input arguments:
-        * sort_by (str='score'): The criteria used to sort the dataset. Available
+        * sort_by (str=''): The criteria used to sort the dataset. Available
         options:
             - 'score': Sorts the sentences by coverage score
             - 'random'
+            - '': The current order
         '''
         if sort_by == 'random':
             sorted_sentences = shuffle(self.sentence_objs)
-        sorted_sentences = sorted(self.sentence_objs,
-            key=operator.attrgetter('score'), reverse=True)
-
+        elif sort_by == 'score':
+            sorted_sentences = sorted(self.sentence_objs,
+                key=operator.attrgetter('score'), reverse=True)
+        else:
+            sorted_sentences = list(self.sentence_objs)
         with open(os.path.join(self.path, 'index.tsv'), 'w') as index_f:
             for sentence in sorted_sentences:
                 for rec_id in sentence.recording_ids:
                     rec = self.get_recording(rec_id)
                     index_f.write(f'{rec.user_id}\t{rec.fname}\t{sentence.fname}\n')
 
-    def create_subset(self, num_samples: int, sort_by: str = 'score',
-        out_path: str = '', exclude_bad: bool = True, max_hours: float = 0.0):
+    def save_info(self, fname: str = ''):
+        '''
+        If recordings or sentences have been removed, this method can be
+        called to update info.json
+        '''
+        if fname == '':
+            fname = 'info.json'
+        dump_json(self.info, os.path.join(self.path, fname))
+
+    def create_subset(self, num_samples: int, sort_by: str = 'same',
+        out_path: str = '', exclude_bad: bool = True, max_hours: float = 0.0,
+        overwrite: bool = False):
         '''
         Create a subset of this dataset by taking the first <num_samples> when
         sorted by a certain criteria. The new dataset is stored at <out_path> if
@@ -181,30 +270,39 @@ class Dataset:
 
         Input arguments:
         * num_samples (str):
-        * sort_by (str='score'): The criteria used to sort the dataset. Available
+        * sort_by (str='same'): The criteria used to sort the dataset. Available
         options:
             - 'score': Sorts the sentences by coverage score
             - 'random'
+            - 'same': The current order
         * out_path (str=''): The target root directory of the new dataset. If it
         is = '' then it will be stored at ../<name>_{num_samples}_{sort_by}
         * exclude_bad (bool=True): If True, no recordings that have been marked as
         bad will be included.
+        * overwrite (bool=False): If True, it will overwrite any directory that may
+        exists on <out_path>
         * TODO : max_hours (float=0.0): If specified, we add sentence up to a duration
         limit rather than sample limit
+
         '''
         if out_path == '':
             out_path = os.path.join(self.path, '..', f'{self.name}_{num_samples}_{sort_by}')
+        if os.path.exists(out_path) and overwrite:
+            shutil.rmtree(out_path)
         # create new directories
         audio_dir = os.path.join(out_path, 'audio')
+        for speaker in self.speakers:
+            os.makedirs(os.path.join(audio_dir, str(speaker.id)))
         text_dir = os.path.join(out_path, 'text')
-        os.makedirs(audio_dir)
         os.makedirs(text_dir)
 
         if sort_by == 'random':
             sorted_sentences = shuffle(self.sentence_objs)
-        sorted_sentences = sorted(self.sentence_objs,
-            key=operator.attrgetter('score'), reverse=True)
-
+        elif sort_by == 'score':
+            sorted_sentences = sorted(self.sentence_objs,
+                key=operator.attrgetter('score'), reverse=True)
+        else:
+            sorted_sentences = list(self.sentence_objs)
         print('Exporting new dataset ...')
         # copy audio and text files and create new info.json
         info = {}
@@ -212,10 +310,9 @@ class Dataset:
             sentence.copy_to(text_dir)
             for r_id in sentence.recording_ids:
                 rec = self.get_recording(r_id)
-                rec.copy_to(audio_dir)
-                info[rec.id] = self.info[rec.id]
-        with open(os.path.join(out_path, 'info.json'), 'w', encoding='utf-8') as info_f:
-            json.dump(info, info_f, ensure_ascii=False, indent=4)
+                rec.copy_to(os.path.join(audio_dir, str(rec.user_id)))
+                info[rec.id] = self.info[str(rec.id)]
+        dump_json(info, os.path.join(out_path, 'info.json'))
 
         # create a new meta.json
         meta = json.load(open(os.path.join(self.path, 'meta.json')))
@@ -225,12 +322,62 @@ class Dataset:
             'sort_by': sort_by,
             'exclude_bad': exclude_bad}
 
-        with open(os.path.join(out_path, 'meta.json'), 'w', encoding='utf-8') as meta_f:
-            json.dump(meta, meta_f, ensure_ascii=False, indent=4)
+        dump_json(meta, os.path.join(out_path, 'meta.json'))
 
         # create a new index.txt
         ds = Dataset(out_path)
-        ds.create_index(sort_by)
+        ds.save_index(sort_by)
+
+    def export(self, out_path: str, format: str = 'basic',
+        sort_by: str = 'same', overwrite: bool = False):
+        '''
+        Create an export of this dataset in various formats
+        Input arguments:
+        * out_path (str): Where the export should be stored
+        * sort_by (str='same'): The criteria used to sort the dataset. Available
+        options:
+            - 'score': Sorts the sentences by coverage score
+            - 'random'
+            - 'same': The current order
+        * overwrite (bool=False): If True, replace anything existing
+        at <out_path> with the export
+        TODO: Actually use and and more formats
+        * format (str): The format of the export. Supports:
+            - 'basic':  out_path/
+                            audio/
+                                0001.wav
+                                ...
+                            text/
+                                0001.txt
+                                ...
+        '''
+
+        audio_dir = os.path.join(out_path, 'audio')
+        text_dir = os.path.join(out_path, 'text')
+        if os.path.exists(out_path) and overwrite:
+            shutil.rmtree(out_path)
+        os.makedirs(audio_dir)
+        os.makedirs(text_dir)
+
+        if sort_by == 'random':
+            sorted_sentences = shuffle(self.sentence_objs)
+        elif sort_by == 'score':
+            sorted_sentences = sorted(self.sentence_objs,
+                key=operator.attrgetter('score'), reverse=True)
+        else:
+            sorted_sentences = list(self.sentence_objs)
+
+        ind = 1
+        fill = len(str(self.num_recordings))
+        for sentence in sorted_sentences:
+            for r_id in sentence.recording_ids:
+                recording = self.get_recording(r_id)
+                shutil.copyfile(sentence.path,
+                    os.path.join(text_dir, f'{str(ind).zfill(fill)}.txt'))
+                shutil.copyfile(recording.path,
+                    os.path.join(audio_dir, f'{str(ind).zfill(fill)}.wav'))
+                ind += 1
+
 
 class Sentence:
     def __init__(self, id: int, fname: str, score: float, text: str,
@@ -248,8 +395,11 @@ class Sentence:
     def set_bad(self, is_bad: bool):
         self.bad = is_bad
 
-    def add_recording_id(self, recording_id):
+    def add_recording_id(self, recording_id: int):
         self.recording_ids.add(recording_id)
+
+    def remove_recording_id(self, recording_id: int):
+        self.recording_ids.remove(recording_id)
 
     def copy_to(self, dir):
         '''
@@ -257,7 +407,6 @@ class Sentence:
         to <dir> with the same filename
         '''
         shutil.copyfile(self.path, os.path.join(dir, self.fname))
-
 
     @property
     def path(self):
@@ -267,13 +416,27 @@ class Sentence:
     def num_recordings(self):
         return len(self.recording_ids)
 
+    @property
+    def info(self):
+        '''
+        Returns the current sentence information in the same format
+        as info.json
+        '''
+        return {
+            'id': self.id,
+            'fname': self.fname,
+            'score': self.score,
+            'text': self.text,
+            'pron': self.pron}
+
+
 class Recording:
     def __init__(self, id: int, recording_fname: str, sr: int, num_channels: int,
         bit_depth: int, duration: float, user_id: int, session_id: int, sentence_id: int,
         collection_path: str):
 
         self.id = id
-        self.sentence_id = id
+        self.sentence_id = sentence_id
         self.fname = recording_fname
         self.sr = sr
         self.num_channels = num_channels
@@ -294,10 +457,13 @@ class Recording:
         '''
         shutil.copyfile(self.path, os.path.join(dir, self.fname))
 
+    def os_delete(self):
+        os.remove(self.path)
 
     @property
     def sox_sample_rate(self):
         return sox.file_info.sample_rate(self.path)
+
     @property
     def sox_num_channels(self):
         return sox.file_info.channels(self.path)
@@ -311,12 +477,51 @@ class Recording:
         return os.path.join(self.collection_path, 'audio', str(self.user_id),
             self.fname)
 
-    def convert(self, transformer, sr: int, bit_depth: int, n_channels: int):
-        transformer.build(self.path,
-            os.path.join(self.collection_path, f'audio_{sr}_{bit_depth}_{n_channels}', self.fname))
+    def convert(self, sr: int, bit_depth: int, n_channels: int, out_dir: str = '',
+        transformer = None):
+        '''
+        Convert a recording to a given format
+        Input arguments:
+        * sr (int): The desired sample rate
+        * bit_depth (int): The desired bit depth
+        * n_channels (int): The desired number of channels
+        * out_dir (str): The directory to save the converted recording
+        * transformer (sox.Transformer / None): A Sox Transformer instance
+        '''
+        if out_dir == '':
+            out_path = os.path.join(self.collection_path,
+                f'audio_{sr}_{bit_depth}_{n_channels}', str(self.user_id), self.fname)
+        else:
+            out_path = os.path.join(out_dir, self.fname)
+        if transformer is None:
+            tfm = sox.Transformer()
+            tfm.convert(samplerate=sr, bitdepth=bit_depth, n_channels=n_channels)
+        transformer.build(self.path, out_path)
+        self.sr = sr
+        self.bit_depth = bit_depth
+        self.num_channels = n_channels
 
-        #TODO: deal with changed parameters here
+    def trim(self, top_db: float = 45):
+        y, sr = load_sample(self.path)
+        trimmed = trim_sample(y, top_db=top_db)
+        self.duration = duration(trimmed, sr=sr)
+        save_sample(trimmed, self.path, sr)
 
+    def check(self, checks: list):
+        is_bad = check(self.path, checks)
+        return is_bad
+
+    @property
+    def info(self):
+        '''
+        Returns the current recording info in the same format as info.json
+        '''
+        return {
+            'recording_fname': self.fname,
+            'sr': self.sr,
+            'num_channels': self.num_channels,
+            'bit_depth': self.bit_depth,
+            'duration': self.duration}
 
 class Speaker:
     def __init__(self, id: int, name: str, email: str, sex:str = '',
@@ -354,3 +559,8 @@ def report(srs, bds, ncs):
     print(f'{"-"*30}')
 
 if __name__ == '__main__':
+    ds = Dataset('/home/atli/Data/test_data/7')
+    ds.export('/home/atli/Data/test_data/7_simple')
+    #ds.convert(overwrite=True)
+    #ds.trim_recordings()
+    #print(ds.get_duration(format='hours'))
